@@ -172,7 +172,9 @@ __constant__ static const uint32_t kKeccakRot[25] = {
 };
 
 __device__ inline uint64_t rotl64(uint64_t x, uint32_t n) {
-    return (x << n) | (x >> (64u - n));
+    // Match aivm_cpu_reference.cpp: mask shift count to avoid UB at n=0.
+    // kKeccakRot[0] == 0, so this path is hit every round.
+    return (x << (n & 63u)) | (x >> ((64u - n) & 63u));
 }
 
 __device__ inline void keccak_f1600(uint64_t* s) {

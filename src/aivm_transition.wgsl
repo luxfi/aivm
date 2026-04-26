@@ -44,7 +44,7 @@ fn aivm_epoch_transition(@builtin(global_invocation_id) gid: vec3<u32>) {
     // -- attestation_root + counts --
     var acc: array<u32, 8>;
     for (var k: u32 = 0u; k < 8u; k = k + 1u) { acc[k] = 0u; }
-    var active: u32 = 0u;
+    var n_active: u32 = 0u;
     var expired: u32 = 0u;
     for (var i: u32 = 0u; i < att_count; i = i + 1u) {
         if (attestations[i].occupied == 0u) { continue; }
@@ -54,7 +54,7 @@ fn aivm_epoch_transition(@builtin(global_invocation_id) gid: vec3<u32>) {
         let exp = (exp_set && exp_le) || (attestations[i].status & kAttStatusExpired) != 0u;
         let ver = (attestations[i].status & kAttStatusVerified) != 0u;
         if (exp) { expired = expired + 1u; }
-        else if (ver) { active = active + 1u; }
+        else if (ver) { n_active = n_active + 1u; }
 
         var buf: array<u32, 96>;
         for (var j: u32 = 0u; j < 96u; j = j + 1u) { buf[j] = 0u; }
@@ -144,7 +144,7 @@ fn aivm_epoch_transition(@builtin(global_invocation_id) gid: vec3<u32>) {
     // -- epoch metadata + closing --
     epoch.active_model_count        = mcount;
     epoch.expired_attestation_count = expired;
-    epoch.total_active_attestations_lo = active;
+    epoch.total_active_attestations_lo = n_active;
     epoch.total_active_attestations_hi = 0u;
     if (desc.closing_flag != 0u) {
         // current_epoch = epoch + 1
@@ -169,7 +169,7 @@ fn aivm_epoch_transition(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k: u32 = 0u; k < 8u; k = k + 1u) { d[k] = epoch.audit_root[k]; }
     absorb_digest(&buf, o, &d); o = o + 32u;
     absorb_u64(&buf, o, epoch.current_epoch_lo, epoch.current_epoch_hi); o = o + 8u;
-    absorb_u32(&buf, o, active); o = o + 4u;
+    absorb_u32(&buf, o, n_active); o = o + 4u;
     absorb_u32(&buf, o, mcount); o = o + 4u;
     absorb_u32(&buf, o, acount); o = o + 4u;
 
@@ -182,7 +182,7 @@ fn aivm_epoch_transition(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k: u32 = 0u; k < 8u; k = k + 1u) { result.model_registry_root[k] = epoch.model_registry_root[k]; }
     for (var k: u32 = 0u; k < 8u; k = k + 1u) { result.audit_root[k]          = epoch.audit_root[k]; }
     for (var k: u32 = 0u; k < 8u; k = k + 1u) { result.aivm_state_root[k]     = epoch.aivm_state_root[k]; }
-    result.active_attestations  = active;
+    result.active_attestations  = n_active;
     result.expired_attestations = expired;
     result.model_count          = mcount;
     result.anchor_count         = acount;

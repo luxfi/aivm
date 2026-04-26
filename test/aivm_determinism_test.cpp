@@ -24,9 +24,16 @@
 
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 using namespace aivm::gpu;
+
+#if defined(LUX_AIVM_TEST_WGPU)
+namespace aivm::gpu {
+std::unique_ptr<AIVMGPUEngine> create_aivm_gpu_engine_wgpu();
+}
+#endif
 
 namespace {
 
@@ -316,24 +323,37 @@ void test_two_engines_match(AIVMGPUEngine* engine)
 
 }  // namespace
 
+void run_all_against(const char* label, AIVMGPUEngine* engine)
+{
+    std::printf("[%s] %s\n", label,
+                engine ? engine->device_name() : "(CPU-only)");
+    test_brief_workload(engine);
+    test_empty_round(engine);
+    test_expiry_excludes(engine);
+    test_wrong_attkey_rejected(engine);
+    test_anchor_chain(engine);
+    test_two_engines_match(engine);
+}
+
 int main(int /*argc*/, char** /*argv*/)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     std::printf("[aivm_determinism_test] starting\n");
 
+    // -- Default backend (Metal on Apple, CUDA on Linux+CUDA, else nullptr) --
     auto engine = AIVMGPUEngine::create();
-    if (engine == nullptr) {
-        std::printf("  note: no GPU backend available — running CPU-only path\n");
-    } else {
-        std::printf("  device: %s\n", engine->device_name());
-    }
+    run_all_against("default", engine.get());
 
-    test_brief_workload(engine.get());
-    test_empty_round(engine.get());
-    test_expiry_excludes(engine.get());
-    test_wrong_attkey_rejected(engine.get());
-    test_anchor_chain(engine.get());
-    test_two_engines_match(engine.get());
+#if defined(LUX_AIVM_TEST_WGPU)
+    // -- WGSL/Dawn backend — runs the same workloads through the WebGPU
+    //    runtime and compares to the CPU oracle for byte equivalence. --
+    auto wgpu_engine = create_aivm_gpu_engine_wgpu();
+    if (wgpu_engine == nullptr) {
+        std::printf("[wgpu] runtime unavailable — driver compiled but no Dawn/wgpu-native at link\n");
+    } else {
+        run_all_against("wgpu", wgpu_engine.get());
+    }
+#endif
 
     std::printf("[aivm_determinism_test] passed=%d failed=%d\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
