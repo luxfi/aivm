@@ -74,6 +74,16 @@ inline uint64_t rotl64(uint64_t x, uint32_t n) {
     return (x << (n & 63u)) | (x >> ((64u - n) & 63u));
 }
 
+// Apple Clang -O3 has been observed miscompiling keccak_f[1600] in sibling
+// agents (XVM caught a multi-block-path miscompile). AIVM exercises the
+// 136-byte+ path: compute_attestation_root absorbs a 140-byte leaf, spilling
+// past one rate block. Pin this function to no-optimization to force the
+// reference oracle to be the literal sequence, never a strength-reduced one.
+#if defined(__clang__)
+__attribute__((optnone))
+#elif defined(__GNUC__)
+__attribute__((optimize("O0")))
+#endif
 void keccak_f1600(uint64_t* s) {
     for (uint32_t round = 0; round < 24u; ++round) {
         uint64_t c[5];

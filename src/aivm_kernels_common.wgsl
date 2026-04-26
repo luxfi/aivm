@@ -455,12 +455,8 @@ fn hash_index(klo: u32, khi: u32, mask: u32) -> u32 {
     return prod_lo & mask;
 }
 
-fn digest_equal_buf(a: ptr<storage, array<u32, 8>, read_write>, b: ptr<function, array<u32, 8>>) -> bool {
-    for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-        if ((*a)[k] != (*b)[k]) { return false; }
-    }
-    return true;
-}
+// Note: WGSL forbids passing storage pointers to functions, so storage-vs-
+// function digest comparisons are inlined at the call site in each kernel.
 
 fn digest_zero_8(d: ptr<function, array<u32, 8>>) -> bool {
     for (var k: u32 = 0u; k < 8u; k = k + 1u) {

@@ -186,7 +186,9 @@ constant uint kKeccakRot[25] = {
 };
 
 inline ulong rotl64(ulong x, uint n) {
-    return (x << n) | (x >> (64u - n));
+    // Match aivm_cpu_reference.cpp: mask shift count to avoid UB at n=0.
+    // kKeccakRot[0] == 0, so this path is hit every round.
+    return (x << (n & 63u)) | (x >> ((64u - n) & 63u));
 }
 
 inline void keccak_f1600(thread ulong* s) {
