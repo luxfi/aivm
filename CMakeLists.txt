@@ -254,6 +254,27 @@ if(LUX_AIVM_BUILD_TESTS)
             LUX_AIVM_TEST_WGPU=1)
     endif()
     add_test(NAME aivm-determinism-test COMMAND aivm-determinism-test)
+
+    # Wall-clock benchmark — built at -O3 -DNDEBUG regardless of outer
+    # CMAKE_BUILD_TYPE so the numbers reflect optimised kernels. Links to
+    # whichever backends are enabled, exactly like the determinism harness.
+    add_executable(aivm-benchmark test/aivm_benchmark.cpp)
+    target_compile_features(aivm-benchmark PRIVATE cxx_std_20)
+    target_compile_options(aivm-benchmark PRIVATE -O3 -DNDEBUG)
+    if(LUX_AIVM_ENABLE_METAL AND APPLE)
+        target_link_libraries(aivm-benchmark PRIVATE lux_aivm_metal)
+    elseif(LUX_AIVM_ENABLE_CUDA)
+        target_link_libraries(aivm-benchmark PRIVATE lux_aivm_cuda)
+    else()
+        target_sources(aivm-benchmark PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/aivm_engine_stub.cpp)
+        target_link_libraries(aivm-benchmark PRIVATE lux_aivm_core)
+    endif()
+    if(LUX_AIVM_ENABLE_WGPU)
+        target_link_libraries(aivm-benchmark PRIVATE lux_aivm_wgpu)
+        target_compile_definitions(aivm-benchmark PRIVATE
+            LUX_AIVM_BENCH_WGPU=1)
+    endif()
 endif()
 
 message(STATUS "")
