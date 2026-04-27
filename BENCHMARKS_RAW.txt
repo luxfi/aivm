@@ -1,0 +1,81 @@
+[aivm_benchmark] starting (warmups=3, iters=10, cap=60s)
+backend: metal  -> Apple M1 Max
+backend: wgsl   -> wgpu-native
+backend: cpu    -> reference oracle
+
+=== FullRound (Attestation + Provenance + Anchor + EpochTransition) ===
+backend    size       mean(ms)    p50(ms)    p95(ms)    p99(ms)        ops/sec     vs CPU  iters
+cpu        small         1.337      1.338      1.381      1.390          74781      1.00x    10 
+cpu        medium        4.414      4.417      4.511      4.538         226549      1.00x    10 
+cpu        large        13.927     13.937     14.071     14.075         718053      1.00x    10 
+cpu        xlarge       39.363     39.329     39.934     39.937        2540461      1.00x    10 
+metal      small        26.303     26.279     26.425     26.427           3802      0.05x    10 
+metal      medium       83.325     83.325     83.491     83.528          12001      0.05x    10 
+metal      large       261.286    261.335    261.533    261.560          38272      0.05x    10 
+metal      xlarge      695.354    695.129    697.044    697.177         143812      0.06x    10 
+wgsl       small      3832.203   1711.237  10223.456  10997.248             26      0.00x    10 
+wgsl       medium     4192.341   3085.777   9928.841  12765.474            239      0.00x    10 
+wgsl       large          skip       skip       skip       skip            —        —      0
+wgsl       xlarge         skip       skip       skip       skip            —        —      0
+
+=== AttestationApply - single-mode kernel breakdown ===
+backend    size       mean(ms)    p50(ms)    p95(ms)    p99(ms)        ops/sec     vs CPU  iters
+cpu        small         1.186      1.178      1.222      1.229          84344      1.00x    10 
+cpu        medium        3.434      3.336      3.932      3.950         291241      1.00x    10 
+cpu        large         3.191      3.163      3.358      3.388        3134125      1.00x    10 
+cpu        xlarge        4.091      4.078      4.170      4.202       24440989      1.00x    10 
+metal      small        23.370     23.371     23.428     23.457           4279      0.05x    10 
+metal      medium       58.530     58.539     58.622     58.645          17085      0.06x    10 
+metal      large        72.738     72.760     72.924     72.967         137480      0.04x    10 
+metal      xlarge       72.772     72.807     72.896     72.923        1374151      0.06x    10 
+wgsl       small      4749.315   4955.738   8403.558   8852.765             21      0.00x    10 
+wgsl       medium         skip       skip       skip       skip            —        —      0
+wgsl       large          skip       skip       skip       skip            —        —      0
+wgsl       xlarge         skip       skip       skip       skip            —        —      0
+
+=== ProvenanceApply - single-mode kernel breakdown ===
+backend    size       mean(ms)    p50(ms)    p95(ms)    p99(ms)        ops/sec     vs CPU  iters
+cpu        small         0.071      0.071      0.073      0.074          70381      1.00x    10 
+cpu        medium        0.639      0.652      0.657      0.659          78300      1.00x    10 
+cpu        large         3.823      3.896      3.905      3.908         130774      1.00x    10 
+cpu        xlarge        3.144      3.101      3.338      3.340        1590413      1.00x    10 
+metal      small         3.573      3.557      3.778      3.831           1399      0.02x    10 
+metal      medium       12.922     12.914     12.990     12.997           3869      0.05x    10 
+metal      large        56.848     55.743     61.912     65.818           8795      0.07x    10 
+metal      xlarge       73.731     73.741     73.847     73.861          67814      0.04x    10 
+wgsl       small      3586.027   1427.623   9267.936   9949.879              1      0.00x    10 
+wgsl       medium         skip       skip       skip       skip            —        —      0
+wgsl       large          skip       skip       skip       skip            —        —      0
+wgsl       xlarge         skip       skip       skip       skip            —        —      0
+
+=== AnchorApply - single-mode kernel breakdown ===
+backend    size       mean(ms)    p50(ms)    p95(ms)    p99(ms)        ops/sec     vs CPU  iters
+cpu        small         0.118      0.117      0.119      0.120          84959      1.00x    10 
+cpu        medium        0.959      0.941      1.025      1.035         104237      1.00x    10 
+cpu        large         7.774      7.768      7.798      7.800         128631      1.00x    10 
+cpu        xlarge       32.268     32.135     32.789     32.794         309902      1.00x    10 
+metal      small         3.854      3.856      4.005      4.031           2595      0.03x    10 
+metal      medium       17.027     17.025     17.103     17.128           5873      0.06x    10 
+metal      large       137.713    136.936    139.982    139.984           7261      0.06x    10 
+metal      xlarge      551.869    551.558    553.777    555.067          18120      0.06x    10 
+wgsl       small      1609.601    511.818   4736.407   4759.745              6      0.00x    10 
+wgsl       medium         skip       skip       skip       skip            —        —      0
+wgsl       large          skip       skip       skip       skip            —        —      0
+wgsl       xlarge         skip       skip       skip       skip            —        —      0
+
+=== EpochTransition - single-mode kernel breakdown ===
+backend    size       mean(ms)    p50(ms)    p95(ms)    p99(ms)        ops/sec     vs CPU  iters
+cpu        small         0.016      0.016      0.017      0.017        6075925      1.00x    10 
+cpu        medium        0.016      0.016      0.017      0.017       60759248      1.00x    10 
+cpu        large         0.016      0.016      0.016      0.016      608987437      1.00x    10 
+cpu        xlarge        0.016      0.016      0.016      0.016     6082096134      1.00x    10 
+metal      small         2.267      2.261      2.309      2.309          44116      0.01x    10 
+metal      medium        2.318      2.319      2.350      2.354         431344      0.01x    10 
+metal      large      1690.897      2.525   8803.212  12812.606           5914      0.00x    10 
+metal      xlarge        2.483      2.423      2.784      2.895       40269539      0.01x    10 
+wgsl       small      1174.440    321.541   5212.714   7972.537             85      0.00x    10 
+wgsl       medium         skip       skip       skip       skip            —        —      0
+wgsl       large          skip       skip       skip       skip            —        —      0
+wgsl       xlarge         skip       skip       skip       skip            —        —      0
+
+[aivm_benchmark] done
