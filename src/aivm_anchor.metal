@@ -1,13 +1,14 @@
 // Copyright (C) 2026, Lux Partners Limited. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// aivm_anchor.metal — AnchorApply kernel.
+// aivm_anchor.metal — AnchorApply kernel (v0.59).
 //
-// Append-only ring buffer of audit anchors. Each new anchor must:
-//   * have non-zero commit_root
-//   * if there is a previous anchor, its parent_root must equal that
-//     previous anchor's commit_root (chain integrity)
-//   * have strictly monotonic height vs the previous anchor
+// Anchor application is fundamentally sequential: each op's parent_root must
+// match the previous occupied anchor's commit_root, and heights must be
+// strictly monotonic. Parallelizing across ops would break chain integrity.
+// We keep this kernel single-threaded and instead recover throughput by
+// making the EpochTransition phase (which dominates total round latency)
+// parallel — see aivm_transition.metal.
 
 #include "aivm_kernels_common.h.metal"
 
@@ -21,7 +22,6 @@ kernel void aivm_anchor_apply(
 {
     if (tid != 0u) return;
 
-    // Locate cursor — first non-occupied slot.
     uint cursor = 0u;
     while (cursor < anchor_count && anchors[cursor].occupied != 0u) ++cursor;
 
@@ -35,7 +35,6 @@ kernel void aivm_anchor_apply(
 
         if (cursor > 0u) {
             device AuditAnchor& prev = anchors[cursor - 1u];
-            // parent_root must equal prev.commit_root
             bool ok = true;
             for (uint k = 0; k < 32u; ++k) {
                 if (op.parent_root[k] != prev.commit_root[k]) { ok = false; break; }

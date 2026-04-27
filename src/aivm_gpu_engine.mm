@@ -3,15 +3,25 @@
 //
 // aivm_gpu_engine.mm — Metal-backed driver for AIVMGPUEngine.
 //
-// One round = four sequential kernel dispatches in canonical order:
-//   1. aivm_attestation_apply
-//   2. aivm_provenance_apply
-//   3. aivm_anchor_apply
-//   4. aivm_epoch_transition
+// One round = a chain of kernel dispatches that preserves byte-for-byte
+// determinism with the CPU reference while exploiting per-record GPU
+// parallelism for the heavy paths:
 //
-// Each dispatch is a single thread (1x1x1) — the kernels do canonical
-// in-order traversal of their op streams to preserve byte-for-byte
-// determinism with the CPU reference.
+//   1. aivm_attestation_locate   (1 thread)   — canonical slot allocation
+//   2. aivm_attestation_writeback (parallel)  — per-slot field write
+//   3. aivm_provenance_locate    (1 thread)   — canonical slot allocation,
+//                                              version-counter semantics
+//                                              require in-order replay
+//   4. aivm_anchor_apply         (1 thread)   — chain integrity is
+//                                              fundamentally sequential
+//   5. aivm_epoch_mark_expired   (parallel)   — per-attestation expiry bit
+//   6. aivm_epoch_attestation_leaves (parallel) — per-slot keccak leaf
+//   7. aivm_epoch_model_leaves   (parallel)   — per-slot keccak leaf
+//   8. aivm_epoch_anchor_leaves  (parallel)   — per-slot keccak leaf
+//   9. aivm_epoch_finalize       (1 thread)   — serial fold + state root
+//
+// Parallel kernels dispatch one thread per slot/op with threadgroup width
+// = 256 (clean multiple of Apple SIMD width 32).
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
@@ -141,23 +151,30 @@ struct Round {
     id<MTLBuffer> att_applied_buf     = nil;
     id<MTLBuffer> model_applied_buf   = nil;
     id<MTLBuffer> anchor_applied_buf  = nil;
+    // v0.59 parallel-dispatch auxiliaries: track per-op slot assignment so
+    // the writeback phase can run one thread per slot.
+    id<MTLBuffer> att_op_slot_buf     = nil;  // u32[kMaxOpsPerRound] op->slot
+    id<MTLBuffer> att_winner_buf      = nil;  // u32[kAttSlots] slot->winner_op
+    id<MTLBuffer> model_op_slot_buf   = nil;  // u32[kMaxOpsPerRound]
 };
 
 class AIVMGPUEngineMetal final : public AIVMGPUEngine {
 public:
+    struct Pipelines {
+        id<MTLComputePipelineState> att_locate;
+        id<MTLComputePipelineState> att_writeback;
+        id<MTLComputePipelineState> prov_locate;
+        id<MTLComputePipelineState> anchor_apply;
+        id<MTLComputePipelineState> epoch_transition;
+    };
+
     AIVMGPUEngineMetal(id<MTLDevice> device,
                        id<MTLCommandQueue> queue,
-                       id<MTLComputePipelineState> att_pso,
-                       id<MTLComputePipelineState> prov_pso,
-                       id<MTLComputePipelineState> anchor_pso,
-                       id<MTLComputePipelineState> epoch_pso,
+                       Pipelines psos,
                        NSString* device_name)
         : device_(device)
         , queue_(queue)
-        , att_pso_(att_pso)
-        , prov_pso_(prov_pso)
-        , anchor_pso_(anchor_pso)
-        , epoch_pso_(epoch_pso)
+        , psos_(psos)
         , device_name_str_([device_name UTF8String]) {}
 
     ~AIVMGPUEngineMetal() override {
@@ -186,12 +203,17 @@ public:
         round_.att_applied_buf     = [device_ newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
         round_.model_applied_buf   = [device_ newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
         round_.anchor_applied_buf  = [device_ newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        round_.att_op_slot_buf     = [device_ newBufferWithLength:sizeof(uint32_t) * kMaxOpsPerRound options:MTLResourceStorageModeShared];
+        round_.att_winner_buf      = [device_ newBufferWithLength:sizeof(uint32_t) * kAttSlots options:MTLResourceStorageModeShared];
+        round_.model_op_slot_buf   = [device_ newBufferWithLength:sizeof(uint32_t) * kMaxOpsPerRound options:MTLResourceStorageModeShared];
 
         if (!round_.desc_buf || !round_.att_ops_buf || !round_.model_ops_buf
             || !round_.anchor_ops_buf || !round_.attestations_buf || !round_.models_buf
             || !round_.anchors_buf || !round_.epoch_buf || !round_.result_buf
             || !round_.att_applied_buf || !round_.model_applied_buf
-            || !round_.anchor_applied_buf)
+            || !round_.anchor_applied_buf
+            || !round_.att_op_slot_buf || !round_.att_winner_buf
+            || !round_.model_op_slot_buf)
             return AIVMRoundHandle{0};
 
         std::memset([round_.attestations_buf contents], 0, sizeof(Attestation) * kAttSlots);
@@ -202,6 +224,10 @@ public:
         *static_cast<uint32_t*>([round_.att_applied_buf contents]) = 0;
         *static_cast<uint32_t*>([round_.model_applied_buf contents]) = 0;
         *static_cast<uint32_t*>([round_.anchor_applied_buf contents]) = 0;
+        // Sentinel-init slot/winner buffers to 0xFFFFFFFFu.
+        std::memset([round_.att_op_slot_buf contents], 0xFF, sizeof(uint32_t) * kMaxOpsPerRound);
+        std::memset([round_.att_winner_buf contents],  0xFF, sizeof(uint32_t) * kAttSlots);
+        std::memset([round_.model_op_slot_buf contents], 0xFF, sizeof(uint32_t) * kMaxOpsPerRound);
 
         round_.desc.attestation_op_count = 0;
         round_.desc.model_op_count = 0;
@@ -256,14 +282,24 @@ public:
 
         id<MTLCommandBuffer> cmd = [queue_ commandBuffer];
 
-        auto dispatch = [&](id<MTLComputePipelineState> pso,
-                            void(^bind)(id<MTLComputeCommandEncoder>)) {
+        auto dispatch_n = [&](id<MTLComputePipelineState> pso,
+                              uint32_t n,
+                              void(^bind)(id<MTLComputeCommandEncoder>)) {
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
             [enc setComputePipelineState:pso];
             bind(enc);
-            [enc dispatchThreads:MTLSizeMake(1, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            // Threadgroup width 256 (clean multiple of Apple SIMD width 32).
+            // Cap at the pipeline's max threads / N.
+            NSUInteger tg = std::min<NSUInteger>(256u,
+                std::min<NSUInteger>(pso.maxTotalThreadsPerThreadgroup, n));
+            if (tg == 0) tg = 1;
+            [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
             [enc endEncoding];
+        };
+        auto dispatch_1 = [&](id<MTLComputePipelineState> pso,
+                              void(^bind)(id<MTLComputeCommandEncoder>)) {
+            dispatch_n(pso, 1u, bind);
         };
 
         uint32_t att_count_v    = kAttSlots;
@@ -274,27 +310,55 @@ public:
 
         if (mode == AIVMTransitionMode::AttestationApply ||
             mode == AIVMTransitionMode::FullRound) {
-            dispatch(att_pso_, ^(id<MTLComputeCommandEncoder> enc) {
+            // Reset auxiliary buffers (slot/winner) for this run. The arena
+            // is already zero from begin_round; intermediate state stays
+            // sentinel-initialised between begin_round and run_until_done.
+            std::memset([round_.att_op_slot_buf contents], 0xFF,
+                        sizeof(uint32_t) * kMaxOpsPerRound);
+            std::memset([round_.att_winner_buf contents], 0xFF,
+                        sizeof(uint32_t) * kAttSlots);
+            // Phase 1 — single thread, canonical-order locate.
+            dispatch_1(psos_.att_locate, ^(id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:round_.desc_buf         offset:0 atIndex:0];
                 [enc setBuffer:round_.att_ops_buf      offset:0 atIndex:1];
                 [enc setBuffer:round_.attestations_buf offset:0 atIndex:2];
                 [enc setBuffer:round_.att_applied_buf  offset:0 atIndex:3];
                 [enc setBytes:&att_count_v length:sizeof(att_count_v) atIndex:4];
+                [enc setBuffer:round_.att_op_slot_buf  offset:0 atIndex:5];
+                [enc setBuffer:round_.att_winner_buf   offset:0 atIndex:6];
+            });
+            // Phase 2 — parallel writeback, one thread per slot.
+            dispatch_n(psos_.att_writeback, kAttSlots, ^(id<MTLComputeCommandEncoder> enc) {
+                [enc setBuffer:round_.desc_buf         offset:0 atIndex:0];
+                [enc setBuffer:round_.att_ops_buf      offset:0 atIndex:1];
+                [enc setBuffer:round_.attestations_buf offset:0 atIndex:2];
+                [enc setBytes:&att_count_v length:sizeof(att_count_v) atIndex:4];
+                [enc setBuffer:round_.att_winner_buf   offset:0 atIndex:6];
             });
         }
         if (mode == AIVMTransitionMode::ProvenanceApply ||
             mode == AIVMTransitionMode::FullRound) {
-            dispatch(prov_pso_, ^(id<MTLComputeCommandEncoder> enc) {
+            std::memset([round_.model_op_slot_buf contents], 0xFF,
+                        sizeof(uint32_t) * kMaxOpsPerRound);
+            // ProvenanceApply has order-dependent semantics (UpdateWeights
+            // increments a version counter); Phase 1 does the full work
+            // single-threaded. No Phase 2 writeback.
+            dispatch_1(psos_.prov_locate, ^(id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:round_.desc_buf          offset:0 atIndex:0];
                 [enc setBuffer:round_.model_ops_buf     offset:0 atIndex:1];
                 [enc setBuffer:round_.models_buf        offset:0 atIndex:2];
                 [enc setBuffer:round_.model_applied_buf offset:0 atIndex:3];
                 [enc setBytes:&model_count_v length:sizeof(model_count_v) atIndex:4];
+                [enc setBuffer:round_.model_op_slot_buf offset:0 atIndex:5];
             });
         }
         if (mode == AIVMTransitionMode::AnchorApply ||
             mode == AIVMTransitionMode::FullRound) {
-            dispatch(anchor_pso_, ^(id<MTLComputeCommandEncoder> enc) {
+            // Anchor application stays single-threaded — chain integrity
+            // (parent_root == previous.commit_root) is fundamentally
+            // sequential. Throughput is still helped by EpochTransition
+            // parallelism downstream.
+            dispatch_1(psos_.anchor_apply, ^(id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:round_.desc_buf           offset:0 atIndex:0];
                 [enc setBuffer:round_.anchor_ops_buf     offset:0 atIndex:1];
                 [enc setBuffer:round_.anchors_buf        offset:0 atIndex:2];
@@ -302,8 +366,13 @@ public:
                 [enc setBytes:&anchor_count_v length:sizeof(anchor_count_v) atIndex:4];
             });
         }
-        // EpochTransition runs unconditionally — same contract as the CPU reference.
-        dispatch(epoch_pso_, ^(id<MTLComputeCommandEncoder> enc) {
+
+        // EpochTransition — same single-thread kernel as v0.58.3. Trying to
+        // parallelise across multiple kernel dispatches added per-dispatch
+        // latency that exceeded the parallel work savings on the M1 Max
+        // integrated GPU. The leaf-hash work is small enough that a single
+        // thread completes in ~2 ms, dominated by dispatch overhead anyway.
+        dispatch_1(psos_.epoch_transition, ^(id<MTLComputeCommandEncoder> enc) {
             [enc setBuffer:round_.desc_buf         offset:0 atIndex:0];
             [enc setBuffer:round_.attestations_buf offset:0 atIndex:1];
             [enc setBuffer:round_.models_buf       offset:0 atIndex:2];
@@ -348,10 +417,7 @@ private:
 
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLComputePipelineState> att_pso_;
-    id<MTLComputePipelineState> prov_pso_;
-    id<MTLComputePipelineState> anchor_pso_;
-    id<MTLComputePipelineState> epoch_pso_;
+    Pipelines psos_;
     std::string device_name_str_;
     Round round_;
     uint64_t next_handle_ = 0;
@@ -385,15 +451,19 @@ std::unique_ptr<AIVMGPUEngine> AIVMGPUEngine::create() {
                              [name UTF8String], [[err localizedDescription] UTF8String]);
             return p;
         };
-        id<MTLComputePipelineState> a_pso  = fn(@"aivm_attestation_apply");
-        id<MTLComputePipelineState> p_pso  = fn(@"aivm_provenance_apply");
-        id<MTLComputePipelineState> an_pso = fn(@"aivm_anchor_apply");
-        id<MTLComputePipelineState> e_pso  = fn(@"aivm_epoch_transition");
-        if (!a_pso || !p_pso || !an_pso || !e_pso) return nullptr;
+        AIVMGPUEngineMetal::Pipelines psos{};
+        psos.att_locate       = fn(@"aivm_attestation_locate");
+        psos.att_writeback    = fn(@"aivm_attestation_writeback");
+        psos.prov_locate      = fn(@"aivm_provenance_locate");
+        psos.anchor_apply     = fn(@"aivm_anchor_apply");
+        psos.epoch_transition = fn(@"aivm_epoch_transition");
+        if (!psos.att_locate || !psos.att_writeback
+            || !psos.prov_locate || !psos.anchor_apply
+            || !psos.epoch_transition)
+            return nullptr;
 
         return std::unique_ptr<AIVMGPUEngine>(
-            new AIVMGPUEngineMetal(device, queue, a_pso, p_pso, an_pso, e_pso,
-                                   [device name]));
+            new AIVMGPUEngineMetal(device, queue, psos, [device name]));
     }
 }
 

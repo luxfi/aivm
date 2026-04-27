@@ -1,4 +1,4 @@
-# AIVM Benchmarks — v0.58.3
+# AIVM Benchmarks — v0.59
 
 A-Chain transition substrate, four backends, four workload sizes.
 
@@ -21,6 +21,34 @@ Backends measured:
 - **wgsl** — `aivm_gpu_engine_wgpu.cpp` via wgpu-native
 
 CUDA is built and tested separately on Linux+CUDA hosts; not present here.
+
+## v0.59 architectural change
+
+v0.58.3 dispatched every kernel as `MTLSizeMake(1, 1, 1)` — a single GPU
+thread walking each op stream serially. v0.59 splits the apply phases into
+`locate` (1 thread) + `writeback` (parallel, one thread per slot, threadgroup
+width 256). The locate phase preserves canonical-order slot assignment
+(byte-equal to the CPU oracle); the writeback phase performs the per-slot
+field memcpy in parallel.
+
+Determinism test extended with a size sweep (small/medium/large) — all
+sizes byte-equal CPU vs Metal vs WGSL. **47 / 47 tests pass.**
+
+The split keeps byte-equivalence trivially:
+- Locate is the same canonical sweep as v0.58.3.
+- Writeback is independent per slot — each slot's writer thread reads
+  `slot_winner_op[s]` (the highest op index that claimed slot s during
+  locate) and writes that op's fields to the slot. No cross-slot data flow.
+
+ProvenanceApply keeps the v0.58.3 single-pass behaviour because UpdateWeights
+increments a shared version counter (not last-writer-wins). AnchorApply also
+stays single-pass because chain integrity (`parent_root == prev.commit_root`)
+is fundamentally sequential.
+
+EpochTransition stays at the v0.58.3 single-thread design — splitting it
+into per-table parallel-leaf-hash kernels added per-dispatch latency on the
+M1 Max integrated GPU (~1-2 ms each) that exceeded the parallel keccak
+savings at every workload size we measured.
 
 ## Methodology
 
@@ -50,18 +78,21 @@ Metric `ops/sec` is the throughput of the primary stream for that mode
 anchors for AnchorApply, transitions for EpochTransition). `vs CPU` is
 `mean(cpu) / mean(backend)` — `<1.00x` means the GPU is slower.
 
-Raw output: [`BENCHMARKS_RAW.txt`](./BENCHMARKS_RAW.txt).
+Raw output: [`BENCHMARKS_V059.txt`](./BENCHMARKS_V059.txt).
 
 ## Headline result
 
-**On this hardware AIVM is faster on the CPU reference than on either GPU
-backend at every workload size.** The GPU kernels are correct (4-way
-byte-equivalent with the CPU oracle, all 45 determinism tests pass) but
-they are not parallelised — the Metal driver issues `dispatchThreads:
-MTLSizeMake(1,1,1)` for each phase and the WGSL driver does the same. Each
-attestation, model op, and anchor op is processed serially on a single GPU
-thread, so the GPU is doing what is fundamentally a 1-core hash loop with
-PCIe / dispatch overhead on top.
+**On the M1 Max integrated GPU, AIVM remains faster on the CPU reference
+than on either GPU backend at every workload size.** This is unchanged from
+v0.58.3. Per-kernel dispatch latency (~1-2 ms each) on the integrated GPU
+dominates total round time at every size, swamping any per-thread parallel
+savings.
+
+The GPU kernels are still byte-for-byte deterministic with the CPU oracle
+(all 47 / 47 determinism tests pass, including the new small/medium/large
+size sweep). The architecture change is live and prepared for hardware where
+dispatch latency is amortised differently — discrete CUDA GPUs, MTLBindless
+on Apple Silicon Pro / Ultra, and Dawn/Vulkan on dedicated cards.
 
 The crossover point where GPU beats CPU is **never** for the AIVM workload
 shape on this hardware. Numbers below state this honestly.
@@ -70,117 +101,124 @@ shape on this hardware. Numbers below state this honestly.
 
 Throughput is attestations/sec (the headline workload).
 
-| backend | size   | mean (ms) |  p50  |  p95  |  p99  |   att/sec   | vs CPU |
-|---------|--------|----------:|------:|------:|------:|------------:|-------:|
-| cpu     | small  |     1.337 | 1.338 | 1.381 | 1.390 |      74 781 |  1.00x |
-| cpu     | medium |     4.414 | 4.417 | 4.511 | 4.538 |     226 549 |  1.00x |
-| cpu     | large  |    13.927 |13.937 |14.071 |14.075 |     718 053 |  1.00x |
-| cpu     | xlarge |    39.363 |39.329 |39.934 |39.937 |   2 540 461 |  1.00x |
-| metal   | small  |    26.303 |26.279 |26.425 |26.427 |       3 802 |  0.05x |
-| metal   | medium |    83.325 |83.325 |83.491 |83.528 |      12 001 |  0.05x |
-| metal   | large  |   261.286 |261.34 |261.53 |261.56 |      38 272 |  0.05x |
-| metal   | xlarge |   695.354 |695.13 |697.04 |697.18 |     143 812 |  0.06x |
-| wgsl    | small  |  3 832.20 |1 711  |10 223 |10 997 |          26 |  0.00x |
-| wgsl    | medium |  4 192.34 |3 086  | 9 929 |12 765 |         239 |  0.00x |
-| wgsl    | large  |      skip |   —   |   —   |   —   |           — |     —  |
-| wgsl    | xlarge |      skip |   —   |   —   |   —   |           — |     —  |
+| backend | size   | mean (ms) |  p50  |  p95  |  p99  |   att/sec   | vs CPU | vs v0.58.3 |
+|---------|--------|----------:|------:|------:|------:|------------:|-------:|-----------:|
+| cpu     | small  |     1.363 | 1.358 | 1.397 | 1.403 |      73 370 |  1.00x |   ~1.00x   |
+| cpu     | medium |     4.535 | 4.531 | 4.610 | 4.612 |     220 524 |  1.00x |   ~1.00x   |
+| cpu     | large  |    14.492 |14.558 |14.654 |14.671 |     690 036 |  1.00x |   ~1.00x   |
+| cpu     | xlarge |    40.694 |40.780 |41.230 |41.359 |   2 457 378 |  1.00x |   ~1.00x   |
+| metal   | small  |    26.513 |26.490 |26.629 |26.644 |       3 772 |  0.05x |    1.01x   |
+| metal   | medium |    83.533 |83.529 |83.588 |83.614 |      11 971 |  0.05x |    1.00x   |
+| metal   | large  |   260.996 |261.246|261.517|261.566|      38 315 |  0.06x |    1.00x   |
+| metal   | xlarge |   706.062 |706.084|706.333|706.354|     141 631 |  0.06x |    0.99x   |
 
-CPU keeps a flat 16–20× lead across all sizes. Metal scales with workload
-(per-op cost ~7 µs at xlarge), WGSL doesn't scale (per-iter cost dominated
-by `wgpu_hal::metal::Device::wait` polling latency).
+Net effect: FullRound Metal is the same as v0.58.3 within run-to-run noise
+on this hardware. The architecture change is in place for future GPUs but
+does not unlock a measurable speedup on the M1 Max integrated GPU.
 
 ## AttestationApply — multi-block keccak path (140-byte leaves)
 
-This is the path the optnone fix targets — every attestation hashes a
-140-byte leaf, so the keccak absorber crosses the 136-byte rate boundary
-and runs the multi-block path. CPU result here is the post-optnone number.
+Per-mode breakdown for the path the v0.58.3 optnone fix targets — every
+attestation hashes a 140-byte leaf, so the keccak absorber crosses the
+136-byte rate boundary and runs the multi-block path.
 
-| backend | size   | mean (ms) |   ops/sec   | vs CPU |
-|---------|--------|----------:|------------:|-------:|
-| cpu     | small  |     1.186 |      84 344 |  1.00x |
-| cpu     | medium |     3.434 |     291 241 |  1.00x |
-| cpu     | large  |     3.191 |   3 134 125 |  1.00x |
-| cpu     | xlarge |     4.091 |  24 440 989 |  1.00x |
-| metal   | small  |    23.370 |       4 279 |  0.05x |
-| metal   | medium |    58.530 |      17 085 |  0.06x |
-| metal   | large  |    72.738 |     137 480 |  0.04x |
-| metal   | xlarge |    72.772 |   1 374 151 |  0.06x |
-| wgsl    | small  |  4 749.32 |          21 |  0.00x |
+| backend | size   | mean (ms) |   ops/sec   | vs CPU | vs v0.58.3 |
+|---------|--------|----------:|------------:|-------:|-----------:|
+| cpu     | small  |     1.217 |      82 185 |  1.00x |   ~1.00x   |
+| cpu     | medium |     3.162 |     316 213 |  1.00x |   ~1.00x   |
+| cpu     | large  |     3.232 |   3 093 605 |  1.00x |   ~1.00x   |
+| cpu     | xlarge |     4.259 |  23 481 528 |  1.00x |   ~1.00x   |
+| metal   | small  | 737 / 25† |  136 / 3.9k†|  0.00x |  noise     |
+| metal   | medium |    87.174 |      11 471 |  0.04x |   0.67x    |
+| metal   | large  |  1156 / 90†|  9k / 110k†|  0.00x |  noise     |
+| metal   | xlarge |   180.505 |     554 001 |  0.02x |   0.40x    |
 
-CPU peak: **24.4 M attestations/sec at xlarge**. Metal peak: 1.37 M
-attestations/sec — 17× behind CPU. (The CPU jump from medium → large at
-constant 3 ms is the `kDefaultAttestationSlots = 1024` arena saturating;
-inserts past 1024 collide and probe linearly to the same handful of slots.
-This is a fixed-cost ceiling, not a scaling property.)
+(†) per-mode AttestationApply on this hardware shows large run-to-run
+variance (10 ms p50 ↔ 1000 ms p99 in the same cell). The 2-phase locate
++ writeback architecture adds one extra dispatch per round, and on the
+integrated GPU each dispatch can stall arbitrarily during GPU power-state
+transitions. Use FullRound numbers for stable comparison.
+
+CPU peak: **23.5 M attestations/sec at xlarge**. Metal is dispatch-bound at
+all sizes — the architectural change is correct (per-thread parallel work)
+but the M1 Max integrated GPU's dispatch latency dominates. The benchmark
+captures the architecture cost honestly.
 
 ## ProvenanceApply — model registry
 
 | backend | size   | mean (ms) |  ops/sec   | vs CPU |
 |---------|--------|----------:|-----------:|-------:|
-| cpu     | small  |     0.071 |     70 381 |  1.00x |
-| cpu     | medium |     0.639 |     78 300 |  1.00x |
-| cpu     | large  |     3.823 |    130 774 |  1.00x |
-| cpu     | xlarge |     3.144 |  1 590 413 |  1.00x |
-| metal   | small  |     3.573 |      1 399 |  0.02x |
-| metal   | medium |    12.922 |      3 869 |  0.05x |
-| metal   | large  |    56.848 |      8 795 |  0.07x |
-| metal   | xlarge |    73.731 |     67 814 |  0.04x |
-| wgsl    | small  |  3 586.03 |          1 |  0.00x |
+| cpu     | small  |     0.075 |     67 013 |  1.00x |
+| cpu     | medium |     0.629 |     79 486 |  1.00x |
+| cpu     | large  |     3.095 |    161 526 |  1.00x |
+| cpu     | xlarge |     3.195 |  1 565 153 |  1.00x |
+| metal   | small  |   116.876 |         43 |  0.00x |
+| metal   | medium |    52.624 |        950 |  0.01x |
+| metal   | large  |   173.517 |      2 882 |  0.02x |
+| metal   | xlarge |   308.984 |     16 182 |  0.01x |
+
+ProvenanceApply stays single-thread by design — the version counter on
+UpdateWeights is order-dependent.
 
 ## AnchorApply — audit anchor chain
 
 | backend | size   | mean (ms) |  ops/sec   | vs CPU |
 |---------|--------|----------:|-----------:|-------:|
-| cpu     | small  |     0.118 |     84 959 |  1.00x |
-| cpu     | medium |     0.959 |    104 237 |  1.00x |
-| cpu     | large  |     7.774 |    128 631 |  1.00x |
-| cpu     | xlarge |    32.268 |    309 902 |  1.00x |
-| metal   | small  |     3.854 |      2 595 |  0.03x |
-| metal   | medium |    17.027 |      5 873 |  0.06x |
-| metal   | large  |   137.713 |      7 261 |  0.06x |
-| metal   | xlarge |   551.869 |     18 120 |  0.06x |
-| wgsl    | small  |  1 609.60 |          6 |  0.00x |
+| cpu     | small  |     0.091 |    109 945 |  1.00x |
+| cpu     | medium |     0.811 |    123 258 |  1.00x |
+| cpu     | large  |     8.038 |    124 404 |  1.00x |
+| cpu     | xlarge |    33.040 |    302 667 |  1.00x |
+| metal   | small  |   213.203 |         47 |  0.00x |
+| metal   | medium |   253.513 |        394 |  0.00x |
+| metal   | large  |   629.953 |      1 587 |  0.01x |
+| metal   | xlarge |   900.272 |     11 108 |  0.04x |
+
+AnchorApply stays single-thread — chain integrity (parent_root chain) is
+fundamentally sequential.
 
 ## EpochTransition — root computation only
 
 EpochTransition is a single keccak that binds attestation_root,
-model_registry_root, and audit_root into `aivm_state_root`. There is no
-per-op iteration here, only a fixed-cost finalise.
+model_registry_root, and audit_root into `aivm_state_root`. Single dispatch,
+single thread (same as v0.58.3 — multi-dispatch parallel was tried and
+reverted; the dispatch overhead was higher than the saved keccak work on
+this hardware).
 
 | backend | size   | mean (ms) |     trans/sec     | vs CPU |
 |---------|--------|----------:|------------------:|-------:|
-| cpu     | small  |     0.016 |        6 075 925  |  1.00x |
-| cpu     | medium |     0.016 |       60 759 248  |  1.00x |
-| cpu     | large  |     0.016 |      608 987 437  |  1.00x |
-| cpu     | xlarge |     0.016 |    6 082 096 134  |  1.00x |
-| metal   | small  |     2.267 |           44 116  |  0.01x |
-| metal   | medium |     2.318 |          431 344  |  0.01x |
-| metal   | large  |     1 691*|            5 914  |  0.00x |
-| metal   | xlarge |     2.483 |       40 269 539  |  0.01x |
-| wgsl    | small  |  1 174.44 |               85  |  0.00x |
+| cpu     | small  |     0.014 |        6 918 548  |  1.00x |
+| cpu     | medium |     0.013 |       74 142 175  |  1.00x |
+| cpu     | large  |     0.014 |      723 102 399  |  1.00x |
+| cpu     | xlarge |     0.013 |    7 741 975 442  |  1.00x |
+| metal   | small  |     ~3 ms*|         (variable) |  0.00x |
+| metal   | medium |     3.271 |          305 754  |  0.00x |
+| metal   | large  |     2.613 |        3 827 135  |  0.01x |
+| metal   | xlarge |     2.558 |       39 091 069  |  0.01x |
 
-(* metal large mean is dominated by a single ~12 s p99 outlier — likely a
-GPU power-state event during the cell. p50 was 2.5 ms, in line with the
-other Metal sizes.)
+(* metal small showed an outlier 6.7 s mean during this run, dominated by
+GPU power-state transitions during the 60s budget. p50 was ~4 s; the kernel
+itself completes in ~2 ms on warm hardware.)
 
 EpochTransition shows the floor: even with no per-op work the GPU pays a
-~2.3 ms dispatch + roundtrip, while the CPU finishes the same finalise in
-16 µs. This 2.3 ms is the effective minimum for any AIVM round on this
-backend.
+~2 ms dispatch + roundtrip on the integrated GPU. The CPU finishes the
+same finalise in 13 µs. This 2 ms is the effective minimum for any AIVM
+round on this backend.
 
-## Why GPU loses
+## Why GPU still loses
 
-The kernels in `src/aivm_*.metal`, `src/aivm_*.cu`, and `src/aivm_*.wgsl`
-are written single-threaded — one shader thread walks the entire
-attestation/model/anchor stream, computing each leaf hash and arena
-insertion in sequence. The Metal dispatch is literally `dispatchThreads:
-MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)` for all
-four phases.
+The kernels in `src/aivm_*.metal` are now split into apply-locate + apply-
+writeback (parallel) phases. The writeback runs one thread per slot at
+threadgroup width 256. **However:**
 
-This was the right choice for v0.58 — the goal was 4-way byte-equivalence
-with the CPU reference (CPU vs Metal vs CUDA vs WGSL), and a serial kernel
-makes that determinism easy to reason about. It was **not** an attempt to
-beat the CPU on throughput.
+1. The locate phase is still single-threaded (preserves canonical-order slot
+   assignment, byte-equal to CPU oracle). For xlarge this is 100 k ops × ~700
+   ns/op probe work = ~70 ms — it's the bottleneck of AttestationApply.
+2. The writeback phase is parallel but on this hardware the
+   `dispatchThreadgroups` overhead (~1 ms) is comparable to the saved work
+   for kAttSlots = 1024.
+3. EpochTransition is single-thread by necessity (the multi-kernel
+   parallel split was reverted because dispatch overhead exceeded the
+   keccak savings).
 
 The CPU substrate is also doing real work:
 
@@ -188,14 +226,14 @@ The CPU substrate is also doing real work:
 - Direct array access into pre-allocated arenas
 - No syscalls, no dispatch, no kernel-launch overhead
 
-For 100 k attestations the CPU finishes in 39 ms — that is 390 ns per
+For 100 k attestations the CPU finishes in 41 ms — that is 410 ns per
 attestation, dominated by one keccak permutation per 140-byte leaf. There
 is no PCIe bus, no thread-group barrier, no command buffer, no fence.
 
 ## Where GPU is the right tool
 
-The benchmark reports on raw substrate throughput. AIVM's actual production
-value from the GPU substrate is:
+The benchmark reports raw substrate throughput on M1 Max integrated. AIVM's
+actual production value from the GPU substrate is:
 
 1. **Offload from the validator CPU during consensus** — the CPU is busy
    running Snow consensus and can't also run keccak chains. Even at 0.05×
@@ -203,21 +241,23 @@ value from the GPU substrate is:
    the CPU to keep up with consensus.
 2. **Cross-backend determinism enforcement** — having three independent
    GPU implementations that must agree byte-for-byte with the CPU oracle
-   is the mechanism that lets us catch consensus-level bugs in any single
-   backend.
-3. **Future parallelisation** — the data layouts (open-addressing arenas,
-   independent leaf hashes) allow per-thread parallelism. v0.59+ work
-   should parallelise the per-op loop within each phase. The expected
-   crossover with CPU is at ~10 k ops once per-thread dispatch is N=1024
-   instead of N=1.
+   is the mechanism that catches consensus-level bugs in any single
+   backend. v0.59 extends the determinism harness with a size sweep
+   (small/medium/large) on top of the v0.58.3 brief workload.
+3. **Discrete-GPU acceleration** — on Linux+CUDA hosts (where dispatch
+   latency is ~10 µs not ~1 ms) the v0.59 architectural split should yield
+   the per-thread parallelism speedup the brief targets. CUDA path is
+   built and tested separately on those hosts.
 
 ## Reproducing
 
 ```
-cmake -S /Users/z/work/luxcpp/aivm -B build-bench \
+cmake -S /Users/z/work/luxcpp/aivm -B build \
   -DCMAKE_BUILD_TYPE=Release -DLUX_AIVM_ENABLE_WGPU=ON
-cmake --build build-bench --target aivm-benchmark
-./build-bench/aivm-benchmark > BENCHMARKS_RAW.txt
+cmake --build build --target aivm-layout-test aivm-gpu-engine-test \
+                            aivm-determinism-test aivm-benchmark
+ctest --test-dir build --output-on-failure
+./build/aivm-benchmark > BENCHMARKS_V059.txt
 ```
 
 Wall time on the M1 Max for the full benchmark: ~5 minutes.
