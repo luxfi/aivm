@@ -220,6 +220,54 @@ void test_brief_workload(AIVMGPUEngine* engine)
     PASS("brief workload (1000a / 50m / 100n) — CPU<->GPU byte match");
 }
 
+// v0.59 extension — sweep size families to catch any size-dependent kernel
+// drift (XVM caught a small/medium-only race at large/xlarge in its parallel
+// rewrite; AIVM's locate-then-writeback is byte-identical at all sizes by
+// construction, but we exercise it explicitly).
+void test_size_sweep(AIVMGPUEngine* engine)
+{
+    if (engine == nullptr) {
+        PASS("size sweep (skipped — no GPU)");
+        return;
+    }
+    struct Size { const char* name; uint32_t a, m, n; };
+    const Size sizes[] = {
+        {"small",   100,    5,    10},
+        {"medium", 1000,   50,   100},
+        // Capped to arena sizes so we exercise saturation but stay
+        // determinism-test fast (xlarge takes minutes through Metal apply).
+        {"large",  1024,  512,  1024},
+    };
+    for (const auto& s : sizes) {
+        std::vector<AttestationOp> a_ops;
+        for (uint64_t i = 1; i <= s.a; ++i)
+            a_ops.push_back(make_att(i, uint8_t(i % 4u)));
+        std::vector<ModelOp> m_ops;
+        for (uint64_t i = 1; i <= s.m; ++i)
+            m_ops.push_back(make_model_register(i, 1000u + i*100u));
+        std::vector<AnchorOp> n_ops;
+        uint8_t parent[32] = {};
+        for (uint64_t h = 1; h <= s.n; ++h) {
+            auto op = make_anchor(h, parent);
+            n_ops.push_back(op);
+            std::memcpy(parent, op.commit_root, 32);
+        }
+
+        auto desc = make_desc(uint64_t(s.a + s.m + s.n));
+        auto cpu = run_cpu(desc, a_ops, m_ops, n_ops);
+        auto gpu = run_gpu(engine, desc, a_ops, m_ops, n_ops);
+        if (!cpu.equals(gpu)) {
+            std::printf("  FAIL[size.%s]: CPU != GPU\n", s.name);
+            std::fflush(stdout);
+            ++g_failed;
+            return;
+        }
+        std::printf("  size %-7s: %u/%u/%u → active=%u models=%u anchors=%u\n",
+                    s.name, s.a, s.m, s.n, gpu.active, gpu.models, gpu.anchors);
+    }
+    PASS("size sweep small/medium/large — CPU<->GPU byte match");
+}
+
 void test_empty_round(AIVMGPUEngine* engine)
 {
     auto desc = make_desc(1u);
@@ -384,6 +432,7 @@ void run_all_against(const char* label, AIVMGPUEngine* engine)
     test_anchor_chain(engine);
     test_two_engines_match(engine);
     test_engine_api_surface(engine);
+    test_size_sweep(engine);
 }
 
 int main(int /*argc*/, char** /*argv*/)

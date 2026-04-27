@@ -8,7 +8,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(lux-aivm
-    VERSION 0.58.0
+    VERSION 0.59.0
     DESCRIPTION "GPU-native A-Chain transition substrate (attestation, AI provenance, audit anchors)"
     LANGUAGES CXX
 )
