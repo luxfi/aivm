@@ -321,6 +321,56 @@ void test_two_engines_match(AIVMGPUEngine* engine)
     PASS("two engines bytewise identical");
 }
 
+void test_engine_api_surface(AIVMGPUEngine* engine)
+{
+    // Drives run_epoch / poll_round_result / round_active / handle hygiene
+    // on whatever GPU backend the harness is currently running.
+    if (engine == nullptr) {
+        PASS("api-surface (skipped — no GPU)");
+        return;
+    }
+    EXPECT("api.idle.before", engine->round_active() == false);
+
+    std::vector<AttestationOp> a_ops;
+    for (uint64_t i = 1; i <= 4; ++i) a_ops.push_back(make_att(i, 0u));
+
+    auto desc = make_desc(1u);
+    auto h = engine->begin_round(desc);
+    EXPECT("api.handle", h.valid());
+    EXPECT("api.idle.during", engine->round_active() == true);
+
+    // Double begin_round must reject without disturbing the active round.
+    auto h2 = engine->begin_round(desc);
+    EXPECT("api.double_begin", h2.valid() == false);
+
+    // Bogus handle ops are silent no-ops.
+    AIVMRoundHandle bogus{0xDEADBEEFu};
+    engine->push_attestation_ops(bogus, a_ops);
+    engine->push_model_ops(bogus, std::span<const ModelOp>{});
+    engine->push_anchor_ops(bogus, std::span<const AnchorOp>{});
+
+    engine->push_attestation_ops(h, a_ops);
+    auto re = engine->run_epoch(h);
+    EXPECT("api.run_epoch.applied", re.attestation_apply_count == 4u);
+    EXPECT("api.run_epoch.status",  re.status == 1u);
+
+    auto rp = engine->poll_round_result(h);
+    EXPECT("api.poll.match", std::memcmp(rp.aivm_state_root,
+                                         re.aivm_state_root, 32) == 0);
+
+    auto rp_bogus = engine->poll_round_result(bogus);
+    bool all_zero = true;
+    for (auto b : rp_bogus.aivm_state_root) if (b != 0) { all_zero = false; break; }
+    EXPECT("api.poll.bogus_zero", all_zero);
+
+    engine->end_round(bogus);
+    EXPECT("api.idle.bogus_endround", engine->round_active() == true);
+
+    engine->end_round(h);
+    EXPECT("api.idle.after", engine->round_active() == false);
+    PASS("API surface: round_active / run_epoch / poll / handle hygiene");
+}
+
 }  // namespace
 
 void run_all_against(const char* label, AIVMGPUEngine* engine)
@@ -333,6 +383,7 @@ void run_all_against(const char* label, AIVMGPUEngine* engine)
     test_wrong_attkey_rejected(engine);
     test_anchor_chain(engine);
     test_two_engines_match(engine);
+    test_engine_api_surface(engine);
 }
 
 int main(int /*argc*/, char** /*argv*/)
