@@ -26,6 +26,7 @@ option(LUX_AIVM_ENABLE_WGPU  "Build WebGPU/WGSL backend" OFF)
 
 add_library(lux_aivm_core STATIC
     src/aivm_cpu_reference.cpp
+    src/ai_precompile.cpp
 )
 
 target_include_directories(lux_aivm_core PUBLIC
@@ -45,6 +46,7 @@ set_target_properties(lux_aivm_core PROPERTIES
 if(LUX_AIVM_ENABLE_METAL AND APPLE)
     add_library(lux_aivm_metal STATIC
         src/aivm_gpu_engine.mm
+        src/ai_precompile_metal.mm
     )
     target_include_directories(lux_aivm_metal PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -274,6 +276,45 @@ if(LUX_AIVM_BUILD_TESTS)
         target_link_libraries(aivm-benchmark PRIVATE lux_aivm_wgpu)
         target_compile_definitions(aivm-benchmark PRIVATE
             LUX_AIVM_BENCH_WGPU=1)
+    endif()
+
+    # ---- AI/ML v0.1 — AI precompile (Apple-only .mm test) ------------------
+
+    if(LUX_AIVM_ENABLE_METAL AND APPLE)
+        # Tiny classifier fixture generator. Produces tiny_classifier.bin
+        # alongside the test binary so the test can load it from CWD.
+        add_executable(aivm-gen-tiny-classifier
+            test/gen_tiny_classifier_fixture.cpp)
+        target_link_libraries(aivm-gen-tiny-classifier PRIVATE lux_aivm_core)
+        target_compile_features(aivm-gen-tiny-classifier PRIVATE cxx_std_20)
+
+        set(_AIVM_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/tiny_classifier.bin)
+        add_custom_command(
+            OUTPUT ${_AIVM_FIXTURE}
+            COMMAND aivm-gen-tiny-classifier ${_AIVM_FIXTURE}
+            DEPENDS aivm-gen-tiny-classifier
+            COMMENT "Writing canonical tiny_classifier.bin fixture")
+        add_custom_target(aivm-tiny-classifier-fixture ALL
+            DEPENDS ${_AIVM_FIXTURE})
+
+        # Stage the metal sources next to the build dir so the runtime loader
+        # finds them via __FILE__-relative search.
+        configure_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/gpu/metal/ai_inference_int8.metal
+            ${CMAKE_CURRENT_BINARY_DIR}/gpu/metal/ai_inference_int8.metal
+            COPYONLY)
+        configure_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/gpu/metal/ai_inference_attest.metal
+            ${CMAKE_CURRENT_BINARY_DIR}/gpu/metal/ai_inference_attest.metal
+            COPYONLY)
+
+        add_executable(ai-precompile-test test/ai_precompile_test.mm)
+        target_link_libraries(ai-precompile-test PRIVATE lux_aivm_metal)
+        target_compile_features(ai-precompile-test PRIVATE cxx_std_20)
+        add_dependencies(ai-precompile-test aivm-tiny-classifier-fixture)
+        add_test(NAME ai-precompile-test
+            COMMAND ai-precompile-test
+            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endif()
 endif()
 
