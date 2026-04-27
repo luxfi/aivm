@@ -351,6 +351,398 @@ void test_cpu_reference_model_update()
     PASS("Model register + update weights + update license");
 }
 
+void test_cpu_reference_model_transfer()
+{
+    // Exercise ModelOpKind::Transfer, which neither of the existing tests
+    // hits. Register a model, then transfer ownership; final owner_addr
+    // must be the new address and the entry must remain occupied.
+    std::vector<ModelOp> ops;
+    auto reg = make_model_register(7u, 4242u);
+    ops.push_back(reg);
+
+    ModelOp xfer = reg;
+    xfer.kind = static_cast<uint32_t>(ModelOpKind::Transfer);
+    for (uint32_t i = 0; i < 20; ++i) xfer.owner_addr[i] = uint8_t(0xE0 + i);
+    ops.push_back(xfer);
+
+    auto desc = make_desc(1u);
+    auto state = ref::AIVMReferenceState::empty();
+    auto r = ref::run_reference(state, desc, {}, ops, {});
+    EXPECT("xfer.applied", r.model_apply_count == 2u);
+    EXPECT("xfer.count",   r.model_count == 1u);
+
+    bool checked = false;
+    for (const auto& m : state.models) {
+        if (m.occupied == 0u) continue;
+        bool match_owner = true;
+        for (uint32_t i = 0; i < 20; ++i)
+            if (m.owner_addr[i] != uint8_t(0xE0 + i)) { match_owner = false; break; }
+        EXPECT("xfer.owner", match_owner);
+        // Transfer does not mutate weight_hash/license_root.
+        EXPECT("xfer.weight_unchanged",
+               std::memcmp(m.weight_hash, reg.weight_hash, 32) == 0);
+        checked = true;
+        break;
+    }
+    EXPECT("xfer.found", checked);
+
+    // Transfer of an unknown model_root must be a no-op (model_locate
+    // miss without insert path).
+    ModelOp xfer_miss = xfer;
+    for (uint32_t i = 0; i < 32; ++i) xfer_miss.model_root[i] = uint8_t(0xA0 ^ i);
+    auto desc2 = make_desc(2u);
+    desc2.epoch = 1u;
+    auto r2 = ref::run_reference(state, desc2, {}, std::span<const ModelOp>(&xfer_miss, 1), {});
+    EXPECT("xfer.miss", r2.model_apply_count == 0u);
+    PASS("Model transfer + transfer-of-missing rejected");
+}
+
+void test_cpu_reference_update_missing_model()
+{
+    // UpdateWeights and UpdateLicense against an unregistered model_root —
+    // both must be no-ops (this exercises model_locate's
+    // "missing without insert" branch).
+    auto desc = make_desc(1u);
+    auto state = ref::AIVMReferenceState::empty();
+
+    ModelOp upd_w{};
+    for (uint32_t i = 0; i < 32; ++i) upd_w.model_root[i]  = uint8_t(0x11 + i);
+    for (uint32_t i = 0; i < 32; ++i) upd_w.weight_hash[i] = uint8_t(0x22 + i);
+    upd_w.kind = static_cast<uint32_t>(ModelOpKind::UpdateWeights);
+
+    ModelOp upd_l{};
+    for (uint32_t i = 0; i < 32; ++i) upd_l.model_root[i]  = uint8_t(0x33 + i);
+    for (uint32_t i = 0; i < 32; ++i) upd_l.weight_hash[i] = uint8_t(0x44 + i);
+    for (uint32_t i = 0; i < 32; ++i) upd_l.license_root[i]= uint8_t(0x55 + i);
+    upd_l.kind = static_cast<uint32_t>(ModelOpKind::UpdateLicense);
+
+    std::vector<ModelOp> ops{upd_w, upd_l};
+    auto r = ref::run_reference(state, desc, {}, ops, {});
+    EXPECT("missupd.zero", r.model_apply_count == 0u);
+    EXPECT("missupd.count", r.model_count == 0u);
+    PASS("UpdateWeights/UpdateLicense on missing model is a no-op");
+}
+
+void test_cpu_reference_zero_input_skipped()
+{
+    // Drives the digest_zero==true branches in apply_attestation_ops and
+    // apply_model_ops which the existing tests do not exercise.
+    auto desc = make_desc(1u);
+    auto state = ref::AIVMReferenceState::empty();
+
+    AttestationOp a_zero{};        // all zero — must be rejected
+    a_zero.kind = 0u;
+    a_zero.evidence_len = 64u;     // metadata set, but digest+key are zero
+
+    AttestationOp a_zero_digest{}; // non-zero key, zero digest
+    for (uint32_t i = 0; i < 48; ++i) a_zero_digest.attesting_key[i] = uint8_t(i + 1u);
+
+    ModelOp m_zero_root{};         // zero model_root
+    for (uint32_t i = 0; i < 32; ++i) m_zero_root.weight_hash[i] = uint8_t(i + 1u);
+    m_zero_root.kind = static_cast<uint32_t>(ModelOpKind::Register);
+
+    ModelOp m_zero_weight{};       // zero weight_hash
+    for (uint32_t i = 0; i < 32; ++i) m_zero_weight.model_root[i] = uint8_t(i + 1u);
+    m_zero_weight.kind = static_cast<uint32_t>(ModelOpKind::Register);
+
+    AnchorOp n_zero{};             // zero commit_root
+    n_zero.height = 1u;
+
+    std::vector<AttestationOp> a_ops{a_zero, a_zero_digest};
+    std::vector<ModelOp>       m_ops{m_zero_root, m_zero_weight};
+    std::vector<AnchorOp>      n_ops{n_zero};
+
+    auto r = ref::run_reference(state, desc, a_ops, m_ops, n_ops);
+    EXPECT("zero.aapply", r.attestation_apply_count == 0u);
+    EXPECT("zero.mapply", r.model_apply_count == 0u);
+    EXPECT("zero.napply", r.anchor_apply_count == 0u);
+    EXPECT("zero.active", r.active_attestations == 0u);
+    EXPECT("zero.models", r.model_count == 0u);
+    EXPECT("zero.anchors", r.anchor_count == 0u);
+    PASS("Zero-digest / zero-root / zero-key inputs are filtered");
+}
+
+void test_cpu_reference_uninitialised_state()
+{
+    // run_reference must lazily populate empty arenas — exercises the
+    // `if (state.attestations.empty()) ...` branches.
+    ref::AIVMReferenceState s; // raw default-constructed, no arenas
+    auto desc = make_desc(1u);
+    auto r = ref::run_reference(s, desc, {}, {}, {});
+    EXPECT("uninit.status", r.status == 1u);
+    EXPECT("uninit.atts.size",   s.attestations.size() == kDefaultAttestationSlots);
+    EXPECT("uninit.models.size", s.models.size()       == kDefaultModelSlots);
+    EXPECT("uninit.anchors.size", s.anchors.size()     == kDefaultAnchorSlots);
+
+    // Same thing again, this time with one of each pre-populated and the
+    // other two empty — checks that the lazy init only fires for the
+    // empty arenas (no double-init).
+    ref::AIVMReferenceState s2;
+    s2.attestations.assign(kDefaultAttestationSlots, Attestation{});
+    auto r2 = ref::run_reference(s2, desc, {}, {}, {});
+    EXPECT("uninit.partial.status", r2.status == 1u);
+    EXPECT("uninit.partial.models", s2.models.size()  == kDefaultModelSlots);
+    EXPECT("uninit.partial.anchors", s2.anchors.size() == kDefaultAnchorSlots);
+    PASS("Lazy state initialisation fires for empty arenas");
+}
+
+void test_cpu_reference_anchor_height_monotonic()
+{
+    // The anchor kernel rejects anchors whose height is <= previous height,
+    // even if the parent_root chains correctly. Exercises the
+    // `op.height <= prev.height` branch in apply_anchor_ops.
+    std::vector<AnchorOp> ops;
+    uint8_t parent[32] = {};
+
+    auto a1 = make_anchor(10u, parent);
+    ops.push_back(a1);
+    std::memcpy(parent, a1.commit_root, 32);
+
+    // Height regression: still chains (parent matches a1.commit_root) but
+    // height is lower than previous. Must be rejected.
+    auto a_bad = make_anchor(5u, parent);
+    ops.push_back(a_bad);
+
+    // Then a valid one again to confirm the kernel keeps going after a
+    // rejection.
+    auto a_good = make_anchor(11u, parent);
+    ops.push_back(a_good);
+
+    auto desc = make_desc(1u);
+    auto state = ref::AIVMReferenceState::empty();
+    auto r = ref::run_reference(state, desc, {}, {}, ops);
+    EXPECT("mono.applied", r.anchor_apply_count == 2u);
+    EXPECT("mono.count",   r.anchor_count == 2u);
+    PASS("Anchor height monotonicity enforced");
+}
+
+void test_cpu_reference_hash_probe_collision()
+{
+    // Force the open-addressing probe-advance branch by constructing two
+    // model_roots whose first 8 bytes collide on the FNV-style index
+    // (mask = kDefaultModelSlots - 1 = 511). After registering both,
+    // model_locate on the second has to probe past the first slot —
+    // exercising the `idx = (idx + 1u) & mask` path that the brief
+    // workloads do not touch.
+    auto fnv_index = [](uint64_t k) -> uint32_t {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        h = (h ^ k) * 0x100000001b3ULL;
+        return uint32_t(h) & (kDefaultModelSlots - 1u);
+    };
+    auto first8 = [](uint8_t out[8], uint64_t v) {
+        for (uint32_t i = 0; i < 8u; ++i) out[i] = uint8_t(v >> (i * 8u));
+    };
+
+    uint64_t k1 = 1u;
+    uint32_t target_bucket = fnv_index(k1);
+    uint64_t k2 = 0;
+    for (uint64_t cand = 2; cand < (1u << 22); ++cand) {
+        if (fnv_index(cand) == target_bucket) { k2 = cand; break; }
+    }
+    EXPECT("probe.found_collision", k2 != 0);
+
+    ModelOp m1{};
+    first8(m1.model_root,  k1); m1.model_root[31]  = 0x11; // distinguish full digest
+    for (uint32_t i = 0; i < 32; ++i) m1.weight_hash[i]  = uint8_t(0xA0 + i);
+    for (uint32_t i = 0; i < 32; ++i) m1.license_root[i] = uint8_t(0xB0 + i);
+    m1.kind = static_cast<uint32_t>(ModelOpKind::Register);
+
+    ModelOp m2{};
+    first8(m2.model_root,  k2); m2.model_root[31]  = 0x22;
+    for (uint32_t i = 0; i < 32; ++i) m2.weight_hash[i]  = uint8_t(0xC0 + i);
+    for (uint32_t i = 0; i < 32; ++i) m2.license_root[i] = uint8_t(0xD0 + i);
+    m2.kind = static_cast<uint32_t>(ModelOpKind::Register);
+
+    // Sanity — the brief slice hashes really do match.
+    uint64_t k1r = 0, k2r = 0;
+    for (uint32_t i = 0; i < 8u; ++i) {
+        k1r |= uint64_t(m1.model_root[i]) << (i * 8u);
+        k2r |= uint64_t(m2.model_root[i]) << (i * 8u);
+    }
+    EXPECT("probe.collide", fnv_index(k1r) == fnv_index(k2r));
+
+    auto desc = make_desc(1u);
+    auto state = ref::AIVMReferenceState::empty();
+    std::vector<ModelOp> ops{m1, m2};
+    auto r = ref::run_reference(state, desc, {}, ops, {});
+    EXPECT("probe.applied", r.model_apply_count == 2u);
+    EXPECT("probe.count",   r.model_count == 2u);
+
+    // Now drive a second-round UpdateLicense for both models — the locate
+    // for m2 must traverse past m1's slot, exercising the probe-advance.
+    ModelOp upd1 = m1;
+    upd1.kind = static_cast<uint32_t>(ModelOpKind::UpdateLicense);
+    for (uint32_t i = 0; i < 32; ++i) upd1.license_root[i] = uint8_t(0x10 ^ i);
+
+    ModelOp upd2 = m2;
+    upd2.kind = static_cast<uint32_t>(ModelOpKind::UpdateLicense);
+    for (uint32_t i = 0; i < 32; ++i) upd2.license_root[i] = uint8_t(0x20 ^ i);
+
+    auto desc2 = make_desc(2u);
+    desc2.epoch = 1u;
+    auto r2 = ref::run_reference(state, desc2, {}, std::vector<ModelOp>{upd1, upd2}, {});
+    EXPECT("probe.upd.applied", r2.model_apply_count == 2u);
+    PASS("Open-addressing probe-advance after hash collision");
+}
+
+void test_cpu_reference_anchor_arena_full()
+{
+    // kDefaultAnchorSlots = 4096. Drive `cursor >= state.anchors.size()`
+    // by pushing more anchors across rounds than the arena can hold.
+    auto state = ref::AIVMReferenceState::empty();
+    uint8_t parent[32] = {};
+    uint64_t height = 1;
+
+    auto run_chunk = [&](uint32_t round, uint32_t count) {
+        std::vector<AnchorOp> ops;
+        for (uint32_t i = 0; i < count; ++i) {
+            auto op = make_anchor(height++, parent);
+            ops.push_back(op);
+            std::memcpy(parent, op.commit_root, 32);
+        }
+        auto desc = make_desc(round);
+        desc.epoch = round - 1u;
+        return ref::run_reference(state, desc, {}, {}, ops);
+    };
+
+    // Fill 4 rounds of 1024 = 4096 (full arena).
+    for (uint32_t r = 1; r <= 4; ++r) {
+        auto rr = run_chunk(r, 1024u);
+        EXPECT("arena.applied", rr.anchor_apply_count == 1024u);
+    }
+
+    // Now push 1 more — the arena is full so cursor >= size and the
+    // op must be dropped without applying.
+    auto over = run_chunk(5u, 1u);
+    EXPECT("arena.overflow", over.anchor_apply_count == 0u);
+    EXPECT("arena.full_count", over.anchor_count == 4096u);
+    PASS("Anchor arena gracefully refuses when full");
+}
+
+void test_cpu_reference_version_saturates()
+{
+    // Force the saturating_add overflow branch by registering a model
+    // and then directly priming its `version` field at UINT64_MAX,
+    // followed by an UpdateWeights op. The reference must clamp the
+    // version to UINT64_MAX rather than wrap.
+    auto desc = make_desc(1u);
+    auto state = ref::AIVMReferenceState::empty();
+
+    auto reg = make_model_register(11u, 999u);
+    auto r = ref::run_reference(state, desc, {},
+                                std::span<const ModelOp>(&reg, 1), {});
+    EXPECT("sat.reg", r.model_apply_count == 1u);
+
+    // Find the model and saturate its version manually.
+    bool primed = false;
+    for (auto& m : state.models) {
+        if (m.occupied == 0u) continue;
+        m.version = UINT64_MAX;
+        primed = true;
+        break;
+    }
+    EXPECT("sat.primed", primed);
+
+    ModelOp upd = reg;
+    upd.kind = static_cast<uint32_t>(ModelOpKind::UpdateWeights);
+    for (uint32_t i = 0; i < 32; ++i) upd.weight_hash[i] = uint8_t(0x77 + i);
+
+    auto desc2 = make_desc(2u);
+    desc2.epoch = 1u;
+    auto r2 = ref::run_reference(state, desc2, {},
+                                 std::span<const ModelOp>(&upd, 1), {});
+    EXPECT("sat.applied", r2.model_apply_count == 1u);
+    for (const auto& m : state.models) {
+        if (m.occupied == 0u) continue;
+        EXPECT("sat.clamped", m.version == UINT64_MAX);
+        break;
+    }
+    PASS("version saturates at UINT64_MAX");
+}
+
+void test_cpu_reference_already_expired_flag()
+{
+    // Drive the `(a.status & kAttStatusExpired) != 0u` branch in
+    // compute_attestation_root: an attestation can already carry the
+    // expired bit even if expiry_ns == 0 (e.g. set by an earlier round).
+    // Brief tests only set expired via expiry_ns timestamps.
+    auto desc = make_desc(1u);
+    auto state = ref::AIVMReferenceState::empty();
+    auto a = make_att(99u, 0u, 0u);
+    auto r = ref::run_reference(state, desc,
+                                std::span<const AttestationOp>(&a, 1), {}, {});
+    EXPECT("flagexp.applied", r.attestation_apply_count == 1u);
+
+    // Manually flip the already-expired bit on the entry, then close
+    // another epoch. The kernel must recognise it as expired without
+    // any expiry_ns trigger.
+    bool flipped = false;
+    for (auto& slot : state.attestations) {
+        if (slot.occupied == 0u) continue;
+        slot.status |= 0x4u;     // kAttStatusExpired
+        flipped = true;
+        break;
+    }
+    EXPECT("flagexp.flipped", flipped);
+
+    auto desc2 = make_desc(2u);
+    desc2.epoch = 1u;
+    auto r2 = ref::run_reference(state, desc2, {}, {}, {});
+    EXPECT("flagexp.expired", r2.expired_attestations == 1u);
+    EXPECT("flagexp.active",  r2.active_attestations == 0u);
+    PASS("Pre-set kAttStatusExpired is honored at root computation");
+}
+
+void test_cpu_reference_modes()
+{
+    // Exercises every AIVMTransitionMode dispatch path — only FullRound is
+    // covered by the brief tests above.
+    auto state = ref::AIVMReferenceState::empty();
+
+    auto a = make_att(1u);
+    auto m = make_model_register(1u);
+    uint8_t parent[32] = {};
+    auto n = make_anchor(1u, parent);
+
+    auto desc_a = make_desc(1u);
+    desc_a.mode = static_cast<uint32_t>(AIVMTransitionMode::AttestationApply);
+    desc_a.closing_flag = 0u;
+    auto ra = ref::run_reference(state, desc_a,
+                                 std::span<const AttestationOp>(&a, 1), {}, {});
+    EXPECT("mode.a.applied", ra.attestation_apply_count == 1u);
+    EXPECT("mode.a.no_models", ra.model_apply_count == 0u);
+    EXPECT("mode.a.no_anchors", ra.anchor_apply_count == 0u);
+
+    auto desc_m = make_desc(2u);
+    desc_m.mode = static_cast<uint32_t>(AIVMTransitionMode::ProvenanceApply);
+    desc_m.closing_flag = 0u;
+    auto rm = ref::run_reference(state, desc_m, {},
+                                 std::span<const ModelOp>(&m, 1), {});
+    EXPECT("mode.m.applied", rm.model_apply_count == 1u);
+    EXPECT("mode.m.no_atts", rm.attestation_apply_count == 0u);
+
+    auto desc_n = make_desc(3u);
+    desc_n.mode = static_cast<uint32_t>(AIVMTransitionMode::AnchorApply);
+    desc_n.closing_flag = 0u;
+    auto rn = ref::run_reference(state, desc_n, {}, {},
+                                 std::span<const AnchorOp>(&n, 1));
+    EXPECT("mode.n.applied", rn.anchor_apply_count == 1u);
+    EXPECT("mode.n.no_models", rn.model_apply_count == 0u);
+
+    auto desc_e = make_desc(4u);
+    desc_e.mode = static_cast<uint32_t>(AIVMTransitionMode::EpochTransition);
+    desc_e.closing_flag = 1u;
+    auto re = ref::run_reference(state, desc_e, {}, {}, {});
+    EXPECT("mode.e.no_apply",
+           re.attestation_apply_count == 0u && re.model_apply_count == 0u
+        && re.anchor_apply_count == 0u);
+    // EpochTransition still computes roots over carried-forward state.
+    bool nz = false;
+    for (auto b : re.aivm_state_root) if (b != 0) { nz = true; break; }
+    EXPECT("mode.e.root_nz", nz);
+    PASS("Each AIVMTransitionMode dispatch path");
+}
+
 }  // namespace
 
 int main(int /*argc*/, char** /*argv*/)
@@ -372,6 +764,16 @@ int main(int /*argc*/, char** /*argv*/)
     test_cpu_reference_anchor_chain();
     test_cpu_reference_empty_round();
     test_cpu_reference_model_update();
+    test_cpu_reference_model_transfer();
+    test_cpu_reference_update_missing_model();
+    test_cpu_reference_zero_input_skipped();
+    test_cpu_reference_uninitialised_state();
+    test_cpu_reference_anchor_height_monotonic();
+    test_cpu_reference_hash_probe_collision();
+    test_cpu_reference_anchor_arena_full();
+    test_cpu_reference_version_saturates();
+    test_cpu_reference_already_expired_flag();
+    test_cpu_reference_modes();
 
     std::printf("[aivm_layout_test] passed=%d failed=%d\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
