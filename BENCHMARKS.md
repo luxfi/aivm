@@ -236,7 +236,7 @@ The benchmark reports raw substrate throughput on M1 Max integrated. AIVM's
 actual production value from the GPU substrate is:
 
 1. **Offload from the validator CPU during consensus** — the CPU is busy
-   running Snow consensus and can't also run keccak chains. Even at 0.05×
+   running Quasar consensus and can't also run keccak chains. Even at 0.05×
    CPU throughput, the GPU running the AIVM round in the background frees
    the CPU to keep up with consensus.
 2. **Cross-backend determinism enforcement** — having three independent
