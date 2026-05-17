@@ -22,6 +22,39 @@ option(LUX_AIVM_ENABLE_METAL "Build Metal backend (Apple)" ${APPLE})
 option(LUX_AIVM_ENABLE_CUDA  "Build CUDA backend" OFF)
 option(LUX_AIVM_ENABLE_WGPU  "Build WebGPU/WGSL backend" OFF)
 
+# ---- optional kernel source override: lux-private/gpu-kernels -------------
+# When lux-gpu-kernels is installed (private moat), prefer its aivm kernel
+# sources over the in-tree OSS attestation copies. Build is CPU-only / in-tree
+# by default; this hook is purely additive — no behaviour change when the
+# private package is absent.
+find_package(lux-gpu-kernels CONFIG QUIET)
+if(lux-gpu-kernels_FOUND)
+    # ${lux-gpu-kernels_DIR} == <prefix>/lib/cmake/lux-gpu-kernels — step up
+    # three levels to recover the install <prefix>.
+    get_filename_component(_LUX_GPU_KERNELS_PREFIX
+        "${lux-gpu-kernels_DIR}/../../.." ABSOLUTE)
+    set(_LUX_AIVM_PRIV_DIR
+        "${_LUX_GPU_KERNELS_PREFIX}/include/lux-gpu-kernels/aivm")
+    if(IS_DIRECTORY "${_LUX_AIVM_PRIV_DIR}/metal")
+        set(LUX_AIVM_KERNEL_DIR_METAL "${_LUX_AIVM_PRIV_DIR}/metal")
+        message(STATUS "lux-gpu-kernels: AIVM metal override → "
+            "${LUX_AIVM_KERNEL_DIR_METAL}")
+    endif()
+    if(IS_DIRECTORY "${_LUX_AIVM_PRIV_DIR}/cuda")
+        set(LUX_AIVM_KERNEL_DIR_CUDA "${_LUX_AIVM_PRIV_DIR}/cuda")
+        message(STATUS "lux-gpu-kernels: AIVM cuda override → "
+            "${LUX_AIVM_KERNEL_DIR_CUDA}")
+    endif()
+else()
+    message(STATUS "lux-gpu-kernels: NOT FOUND — using in-tree AIVM kernels")
+endif()
+if(NOT LUX_AIVM_KERNEL_DIR_METAL)
+    set(LUX_AIVM_KERNEL_DIR_METAL "${CMAKE_CURRENT_SOURCE_DIR}/src")
+endif()
+if(NOT LUX_AIVM_KERNEL_DIR_CUDA)
+    set(LUX_AIVM_KERNEL_DIR_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/src")
+endif()
+
 # ---- core library (host code: layout + CPU reference) ---------------------
 
 add_library(lux_aivm_core STATIC
@@ -59,7 +92,9 @@ if(LUX_AIVM_ENABLE_METAL AND APPLE)
         POSITION_INDEPENDENT_CODE ON
     )
 
-    # Stage the .metal sources for runtime fallback.
+    # Stage the .metal sources for runtime fallback. Source path is taken
+    # from LUX_AIVM_KERNEL_DIR_METAL (defaults to in-tree src/, overridable
+    # via lux-gpu-kernels package discovery above).
     foreach(src
         aivm_kernels_common.h.metal
         aivm_attestation.metal
@@ -67,7 +102,7 @@ if(LUX_AIVM_ENABLE_METAL AND APPLE)
         aivm_anchor.metal
         aivm_transition.metal)
         configure_file(
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/${src}
+            ${LUX_AIVM_KERNEL_DIR_METAL}/${src}
             ${CMAKE_CURRENT_BINARY_DIR}/src/${src}
             COPYONLY)
     endforeach()
@@ -80,13 +115,13 @@ if(LUX_AIVM_ENABLE_METAL AND APPLE)
     set(AIVM_METAL_COMBINED ${CMAKE_CURRENT_BINARY_DIR}/src/aivm_combined.metal)
     add_custom_command(
         OUTPUT ${AIVM_METAL_COMBINED}
-        COMMAND bash -c "cat ${CMAKE_CURRENT_SOURCE_DIR}/src/aivm_kernels_common.h.metal > ${AIVM_METAL_COMBINED} && for f in aivm_attestation.metal aivm_provenance.metal aivm_anchor.metal aivm_transition.metal; do grep -v 'aivm_kernels_common.h.metal' ${CMAKE_CURRENT_SOURCE_DIR}/src/$f >> ${AIVM_METAL_COMBINED}; done"
+        COMMAND bash -c "cat ${LUX_AIVM_KERNEL_DIR_METAL}/aivm_kernels_common.h.metal > ${AIVM_METAL_COMBINED} && for f in aivm_attestation.metal aivm_provenance.metal aivm_anchor.metal aivm_transition.metal; do grep -v 'aivm_kernels_common.h.metal' ${LUX_AIVM_KERNEL_DIR_METAL}/$f >> ${AIVM_METAL_COMBINED}; done"
         DEPENDS
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/aivm_kernels_common.h.metal
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/aivm_attestation.metal
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/aivm_provenance.metal
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/aivm_anchor.metal
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/aivm_transition.metal
+            ${LUX_AIVM_KERNEL_DIR_METAL}/aivm_kernels_common.h.metal
+            ${LUX_AIVM_KERNEL_DIR_METAL}/aivm_attestation.metal
+            ${LUX_AIVM_KERNEL_DIR_METAL}/aivm_provenance.metal
+            ${LUX_AIVM_KERNEL_DIR_METAL}/aivm_anchor.metal
+            ${LUX_AIVM_KERNEL_DIR_METAL}/aivm_transition.metal
         VERBATIM)
 
     set(AIVM_METAL_AIR ${CMAKE_CURRENT_BINARY_DIR}/src/aivm_combined.air)
@@ -115,13 +150,15 @@ endif()
 
 if(LUX_AIVM_ENABLE_CUDA)
     enable_language(CUDA)
+    # CUDA kernel sources resolve via LUX_AIVM_KERNEL_DIR_CUDA (defaults to
+    # in-tree src/, overridable via lux-gpu-kernels package discovery above).
     add_library(lux_aivm_cuda STATIC
         src/aivm_gpu_engine_cuda.cpp
-        src/aivm_cuda_launchers.cu
-        src/aivm_attestation.cu
-        src/aivm_provenance.cu
-        src/aivm_anchor.cu
-        src/aivm_transition.cu
+        ${LUX_AIVM_KERNEL_DIR_CUDA}/aivm_cuda_launchers.cu
+        ${LUX_AIVM_KERNEL_DIR_CUDA}/aivm_attestation.cu
+        ${LUX_AIVM_KERNEL_DIR_CUDA}/aivm_provenance.cu
+        ${LUX_AIVM_KERNEL_DIR_CUDA}/aivm_anchor.cu
+        ${LUX_AIVM_KERNEL_DIR_CUDA}/aivm_transition.cu
     )
     target_include_directories(lux_aivm_cuda PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
