@@ -48,11 +48,22 @@ if(lux-gpu-kernels_FOUND)
 else()
     message(STATUS "lux-gpu-kernels: NOT FOUND — using in-tree AIVM kernels")
 endif()
+# Canonical home: lux-private/gpu-kernels/kernels/aivm/{metal,cuda,wgsl}/.
+# The find_package(lux-gpu-kernels) hook above already prefers the installed
+# location when present; these fallbacks target the in-tree sibling checkout.
+if(NOT LUX_PRIVATE_GPU_KERNELS_DIR)
+    set(LUX_PRIVATE_GPU_KERNELS_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../lux-private/gpu-kernels"
+        CACHE PATH "Path to lux-private/gpu-kernels checkout")
+endif()
 if(NOT LUX_AIVM_KERNEL_DIR_METAL)
-    set(LUX_AIVM_KERNEL_DIR_METAL "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    set(LUX_AIVM_KERNEL_DIR_METAL "${LUX_PRIVATE_GPU_KERNELS_DIR}/kernels/aivm/metal")
 endif()
 if(NOT LUX_AIVM_KERNEL_DIR_CUDA)
-    set(LUX_AIVM_KERNEL_DIR_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    set(LUX_AIVM_KERNEL_DIR_CUDA "${LUX_PRIVATE_GPU_KERNELS_DIR}/kernels/aivm/cuda")
+endif()
+if(NOT LUX_AIVM_KERNEL_DIR_WGSL)
+    set(LUX_AIVM_KERNEL_DIR_WGSL "${LUX_PRIVATE_GPU_KERNELS_DIR}/kernels/aivm/wgsl")
 endif()
 
 # ---- core library (host code: layout + CPU reference) ---------------------
@@ -209,7 +220,7 @@ if(LUX_AIVM_ENABLE_WGPU)
     foreach(i RANGE 0 ${_LAST})
         list(GET _AIVM_WGSL_FILES ${i} _SRC)
         list(GET _AIVM_WGSL_NAMES ${i} _NAME)
-        file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/${_SRC} _CONTENT)
+        file(READ ${LUX_AIVM_KERNEL_DIR_WGSL}/${_SRC} _CONTENT)
         file(APPEND ${_AIVM_WGSL_HEADER}
             "// ---- ${_SRC} ----\n"
             "static constexpr char kAIVMWGSL_${_NAME}[] = R\"AIVMWGSL(\n${_CONTENT}\n)AIVMWGSL\";\n\n")
@@ -335,13 +346,15 @@ if(LUX_AIVM_BUILD_TESTS)
             DEPENDS ${_AIVM_FIXTURE})
 
         # Stage the metal sources next to the build dir so the runtime loader
-        # finds them via __FILE__-relative search.
+        # finds them via __FILE__-relative search. Canonical home for these
+        # kernels is lux-private/gpu-kernels/kernels/aivm/metal/ (alongside
+        # the rest of the AIVM metal kernels).
         configure_file(
-            ${CMAKE_CURRENT_SOURCE_DIR}/gpu/metal/ai_inference_int8.metal
+            ${LUX_AIVM_KERNEL_DIR_METAL}/ai_inference_int8.metal
             ${CMAKE_CURRENT_BINARY_DIR}/gpu/metal/ai_inference_int8.metal
             COPYONLY)
         configure_file(
-            ${CMAKE_CURRENT_SOURCE_DIR}/gpu/metal/ai_inference_attest.metal
+            ${LUX_AIVM_KERNEL_DIR_METAL}/ai_inference_attest.metal
             ${CMAKE_CURRENT_BINARY_DIR}/gpu/metal/ai_inference_attest.metal
             COPYONLY)
 
