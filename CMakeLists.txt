@@ -161,6 +161,7 @@ endif()
 
 if(LUX_AIVM_ENABLE_CUDA)
     enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
     # CUDA kernel sources resolve via LUX_AIVM_KERNEL_DIR_CUDA (defaults to
     # in-tree src/, overridable via lux-gpu-kernels package discovery above).
     add_library(lux_aivm_cuda STATIC
@@ -174,14 +175,20 @@ if(LUX_AIVM_ENABLE_CUDA)
     target_include_directories(lux_aivm_cuda PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+        # Bring the lux-private/gpu-kernels/kernels/aivm/cuda dir on the
+        # include path so .cu files can resolve "aivm_kernels_common.cuh"
+        # (sibling header) — and so the launchers cu/cpp can resolve it too.
+        $<BUILD_INTERFACE:${LUX_AIVM_KERNEL_DIR_CUDA}>
     )
+    # The host-side engine TU pulls in <cuda_runtime.h>; expose the CUDA
+    # toolkit headers so the regular C++ compiler can find it.
+    target_link_libraries(lux_aivm_cuda PUBLIC lux_aivm_core CUDA::cudart)
     set_target_properties(lux_aivm_cuda PROPERTIES
         CUDA_STANDARD 17
         CUDA_SEPARABLE_COMPILATION ON
         POSITION_INDEPENDENT_CODE ON
         OUTPUT_NAME "lux_aivm_cuda"
     )
-    target_link_libraries(lux_aivm_cuda PUBLIC lux_aivm_core)
 endif()
 
 # ---- WGPU driver ---------------------------------------------------------
