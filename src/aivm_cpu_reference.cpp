@@ -21,9 +21,9 @@
 /// signature as verified iff (a) the attesting_key is non-zero and
 /// (b) the tee_quote_digest is non-zero. The four GPU backends apply the
 /// same predicate so that cross-backend roots match byte-for-byte without
-/// pulling the BLS / Ringtail / Groth16 verifier core into AIVM. The
+/// pulling the BLS / Corona / Groth16 verifier core into AIVM. The
 /// production deployment will link against
-/// quasar_bls_verifier / quasar_ringtail_verifier / quasar_groth16_verifier
+/// quasar_bls_verifier / quasar_corona_verifier / quasar_groth16_verifier
 /// before kernel launch (host-side) and zero out the attesting_key field
 /// on any op that fails verification — keeping the on-GPU predicate
 /// trivially deterministic. This matches the design used in cevm/quasar.

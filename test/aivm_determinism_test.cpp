@@ -11,7 +11,7 @@
 // fourth path automatically.
 //
 // Workloads (the brief):
-//   1. 1000 attestations across 4 quote families (BLS / Ringtail /
+//   1. 1000 attestations across 4 quote families (BLS / Corona /
 //      Groth16 / SLH-DSA) → byte-equivalent across backends
 //   2. 50 model registrations + license-update path
 //   3. 100 audit anchors with parent-root chain integrity
@@ -181,7 +181,7 @@ WorkloadResult run_gpu(AIVMGPUEngine* engine,
 void test_brief_workload(AIVMGPUEngine* engine)
 {
     std::vector<AttestationOp> a_ops;
-    // 1000 attestations across 4 kinds (BLS=0/SGX, Ringtail=1/SEV,
+    // 1000 attestations across 4 kinds (BLS=0/SGX, Corona=1/SEV,
     // Groth16=2/TDX, SLH-DSA=3/NvTrust). The kernel does not branch on
     // kind; the kind only enters the leaf hash so different kinds produce
     // different roots. Mix them to exercise all four.
