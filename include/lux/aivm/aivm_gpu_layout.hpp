@@ -64,7 +64,7 @@ enum class AttestationKind : uint32_t {
 //
 // Each slot binds a TEE quote to an attesting public key with an expiry.
 // The kernel verifies the quote signature in batches by linking against
-// quasar_bls_verifier / quasar_ringtail_verifier / quasar_groth16_verifier
+// quasar_bls_verifier / quasar_corona_verifier / quasar_groth16_verifier
 // (host-side decision based on kind), and only commits the entry if the
 // signature verifies AND the quote has not expired.
 //
